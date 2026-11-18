@@ -161,6 +161,71 @@ def test_concurrent_compaction_rejected(tmp_path):
         assert wait_job(c, DAY, r3.json()["job_id"])["status"] == "done"
 
 
+def test_acceptance_after_reclamation_uses_current_active_set(tmp_path):
+    """The reported race, deterministically: job 1 merges, its retired
+    inputs are reclaimed, and only THEN is a second compaction accepted.
+    It must be registered against the complete active set of that moment
+    (never the stale pre-switch manifest) and succeed."""
+    with make_client(tmp_path, gc_interval_sec=0.05) as c:
+        upload(c, CSV_A)
+        upload(c, CSV_B)
+        data_dir = tmp_path / "data" / f"dt={DAY}"
+        first_gen = {p.name for p in data_dir.glob("*.parquet")}
+        assert len(first_gen) == 2
+
+        job1 = c.post(f"/days/{DAY}/compactions").json()["job_id"]
+        assert wait_job(c, DAY, job1)["status"] == "done"
+        upload(c, CSV_C)  # appended after the switch
+
+        # the first-generation files are reclaimed before we ask again
+        deadline = time.time() + 10
+        while first_gen & {p.name for p in data_dir.glob("*.parquet")}:
+            assert time.time() < deadline, "retired files were not reclaimed"
+            time.sleep(0.05)
+
+        r = c.post(f"/days/{DAY}/compactions")
+        assert r.status_code == 202, r.text
+        job = wait_job(c, DAY, r.json()["job_id"])
+        assert job["status"] == "done", job
+        # registered against exactly the active set at acceptance time:
+        # job 1's compacted output + the upload appended since the switch
+        assert len(job["input_files"]) == 2
+        assert any(n.startswith("compacted-") for n in job["input_files"])
+        assert any(n.startswith("part-") for n in job["input_files"])
+        assert not set(job["input_files"]) & first_gen  # no reclaimed files
+        assert job["input_rows"] == 5 and job["output_rows"] == 5
+
+        body = c.get(f"/days/{DAY}/records").json()
+        assert body["file_count"] == 1 and body["row_count"] == 5
+
+
+def test_acceptance_race_never_yields_failed_job(tmp_path):
+    """Hammer acceptance across job-completion boundaries while GC reclaims
+    retired files and uploads keep arriving: every accepted (202) job must
+    finish 'done' (never fail on missing inputs); attempts during a run
+    get 409; all appended rows survive."""
+    with make_client(tmp_path, compaction_delay_sec=0.1, gc_interval_sec=0.02) as c:
+        upload(c, CSV_A)
+        upload(c, CSV_B)
+        accepted = []
+        extra_uploads = 0
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            r = c.post(f"/days/{DAY}/compactions")
+            if r.status_code == 202:
+                accepted.append(r.json()["job_id"])
+            else:
+                assert r.status_code == 409, r.text
+            upload(c, CSV_C)
+            extra_uploads += 1
+        assert accepted, "expected at least one accepted compaction"
+        for job_id in accepted:
+            job = wait_job(c, DAY, job_id)
+            assert job["status"] == "done", job
+        body = c.get(f"/days/{DAY}/records").json()
+        assert body["row_count"] == 4 + extra_uploads
+
+
 def test_upload_and_read_during_compaction(tmp_path):
     """Appends during compaction stay readable and survive the switch."""
     with make_client(tmp_path, compaction_delay_sec=0.8) as c:
@@ -341,6 +406,59 @@ def test_restart_resumes_interrupted_compaction(tmp_path):
 
         body = c.get(f"/days/{DAY}/records").json()
         assert body["file_count"] == 1 and body["row_count"] == 4
+
+
+def test_restart_after_reclamation_resumes_accepted_job(tmp_path):
+    """Switch + reclamation + crash, then restart: an accepted job must
+    still reference only live files, and recovery must not delete them."""
+    data_dir = tmp_path / "data"
+
+    lake1 = Lake(str(data_dir))
+    lake1.upload(DAY, CSV_A.encode())
+    lake1.upload(DAY, CSV_B.encode())
+    day_dir = data_dir / f"dt={DAY}"
+    first_gen = {p.name for p in day_dir.glob("*.parquet")}
+
+    # job 1 runs to completion; its retired inputs are reclaimed
+    job1 = lake1.start_compaction(DAY)["job_id"]
+    deadline = time.time() + 15
+    while lake1.get_compaction(job1)["status"] == "running":
+        assert time.time() < deadline
+        time.sleep(0.05)
+    assert lake1.get_compaction(job1)["status"] == "done"
+    lake1.upload(DAY, CSV_C.encode())  # appended after the switch
+    lake1.collect_garbage()
+    assert not first_gen & {p.name for p in day_dir.glob("*.parquet")}
+
+    # job 2 is accepted (row persisted as 'running') and the process dies
+    # before its worker executes -- the persisted accepted state
+    with connect(str(lake1.db_path)) as conn:
+        rows = conn.execute(
+            "SELECT path FROM files WHERE day = ? AND state = 'active'", (DAY,)
+        ).fetchall()
+        conn.execute(
+            "INSERT INTO compactions(day, status, input_paths, input_rows, created_at)"
+            " VALUES (?, 'running', ?, ?, ?)",
+            (DAY, json.dumps([r["path"] for r in rows]), 5, "2026-11-18T00:00:00Z"),
+        )
+    del lake1  # "process dies"
+
+    with make_client(tmp_path) as c:
+        # recovery must not touch job 2's inputs; it resumes and finishes
+        deadline = time.time() + 15
+        job = None
+        while time.time() < deadline:
+            jobs = c.get(f"/days/{DAY}/compactions").json()["jobs"]
+            assert len(jobs) == 2
+            job = jobs[0]  # most recent first
+            if job["status"] in ("done", "failed"):
+                break
+            time.sleep(0.05)
+        assert job["status"] == "done", job
+        assert job["input_rows"] == 5 and job["output_rows"] == 5
+
+        body = c.get(f"/days/{DAY}/records").json()
+        assert body["file_count"] == 1 and body["row_count"] == 5
 
 
 def test_restart_preserves_uploads_and_cleans_orphans(tmp_path):

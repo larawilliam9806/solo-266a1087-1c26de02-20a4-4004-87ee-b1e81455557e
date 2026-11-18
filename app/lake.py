@@ -8,10 +8,16 @@ Consistency model (single process, SQLite as the source of truth):
 * Read: the active file list is snapshotted and refcounted under one lock,
   so a read always corresponds to the complete pre- or post-switch state --
   never a mix.  Retired files stay on disk until their refcount hits zero.
-* Compaction: merges the files registered at job start into one parquet,
-  then switches the registry in a single transaction.  Rows appended during
-  the merge are not part of the input snapshot, so they survive the switch
-  untouched and remain readable throughout.
+* Compaction: acceptance (running-job check + active-file snapshot + job
+  registration) happens in ONE immediate transaction, so a job is either
+  rejected with 409 while another is running, or registered against exactly
+  the active set of that moment.  The merge then only touches that
+  registered set; rows appended during the merge are not part of it, so
+  they survive the switch untouched and remain readable throughout.
+  Registered inputs stay ``active`` until the job's own switch retires
+  them, and the reclaimer only unlinks ``retired`` files -- an accepted
+  job can therefore never reference reclaimed bytes, even across a
+  switch, a reclamation sweep, or an interrupted restart.
 * Recovery: the switch and the job-status update commit atomically, so a
   job still ``running`` at startup is guaranteed not to have switched; it
   is simply re-executed.  Orphaned bytes (failed uploads, superseded
@@ -183,9 +189,37 @@ class Lake:
     # compaction
     # ------------------------------------------------------------------
     def start_compaction(self, day: str) -> dict:
-        """Register and launch a background compaction. Raises ConflictError."""
-        input_rows = 0
-        with connect(str(self.db_path)) as conn:
+        """Register and launch a background compaction. Raises ConflictError.
+
+        The running-job check, the active-file snapshot and the job
+        registration commit in ONE immediate transaction, serialised
+        against the compaction switch (also an immediate transaction):
+
+        * a same-day job still running -> we see its row -> 409;
+        * the previous job's switch already committed -> the snapshot is
+          the complete active set of *this* moment (compacted output plus
+          any uploads appended since), never a stale pre-switch manifest.
+
+        Because the registered inputs are ``active`` files and the
+        reclaimer only unlinks ``retired`` ones, an accepted job's inputs
+        cannot be reclaimed before its own switch retires them -- the
+        background worker never merges files that no longer exist.
+        """
+        conn = connect(str(self.db_path))
+        try:
+            # BEGIN IMMEDIATE takes the DB write lock up front: no switch
+            # (retire + register output + done) can commit between our
+            # snapshot and our registration.
+            conn.execute("BEGIN IMMEDIATE")
+            running = conn.execute(
+                "SELECT id FROM compactions WHERE day = ? AND status = 'running'",
+                (day,),
+            ).fetchone()
+            if running is not None:
+                raise ConflictError(
+                    f"a compaction is already running for day {day}"
+                    f" (job {running['id']})"
+                )
             rows = conn.execute(
                 "SELECT path, rows FROM files WHERE day = ? AND state = 'active' ORDER BY id",
                 (day,),
@@ -199,8 +233,18 @@ class Lake:
                     (day, json.dumps(input_paths), input_rows, _now_iso()),
                 )
             except sqlite3.IntegrityError as exc:
-                raise ConflictError(f"a compaction is already running for day {day}") from exc
+                # Backstop: the DB-level partial unique index still guards
+                # the invariant even if the check above is ever bypassed.
+                raise ConflictError(
+                    f"a compaction is already running for day {day}"
+                ) from exc
             job_id = cur.lastrowid
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
         self._launch_worker(job_id, day, input_paths)
         log.info("compaction job %s started for %s over %d files", job_id, day, len(input_paths))
         return self.get_compaction(job_id)
